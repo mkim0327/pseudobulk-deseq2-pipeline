@@ -40,11 +40,30 @@ run_deseq2_analysis <- function(counts_pb, sample_metadata) {
 
     message("\n  ── Cell type: ", cell_type, " ──")
 
-    # ── 1. Gene filtering ──────────────────────────────────────────────────────
+    # ── 1. Sample and gene filtering ──────────────────────────────────────────
 
-    counts     <- counts_pb[[cell_type]]
+    counts <- counts_pb[[cell_type]]
+
+    # Drop samples with all-zero counts (muscat keeps zero columns for samples
+    # that fall below MIN_CELLS_PER_SAMPLE; they break size factor estimation)
+    sample_totals <- colSums(counts)
+    if (any(sample_totals == 0)) {
+      zero_samps <- names(sample_totals[sample_totals == 0])
+      message("    Removing ", length(zero_samps),
+              " all-zero sample(s): ", paste(zero_samps, collapse = ", "))
+      counts <- counts[, sample_totals > 0, drop = FALSE]
+    }
+    if (ncol(counts) < MIN_SAMPLES_PASSING) {
+      message("    Skipping — only ", ncol(counts), " non-zero sample(s) remain",
+              " (< MIN_SAMPLES_PASSING = ", MIN_SAMPLES_PASSING, ").")
+      next
+    }
+
     good_genes <- rowSums(counts > 0) >= MIN_SAMPLES_EXPRESSED
     counts     <- counts[good_genes, ]
+
+    # Coerce to integer (handles non-integer source assays, e.g. Tabula Sapiens)
+    storage.mode(counts) <- "integer"
 
     if (nrow(counts) == 0) {
       message("    Skipping — no genes passed expression filter.")
@@ -73,6 +92,7 @@ run_deseq2_analysis <- function(counts_pb, sample_metadata) {
     scale_factors  <- list()
     original_vals  <- list()   # unscaled values used for plot colors/ordering
 
+    skip_ct <- FALSE
     for (bv in bio_var_names) {
       spec <- BIO_VARS[[bv]]
       if (spec$type == "numeric") {
@@ -80,6 +100,12 @@ run_deseq2_analysis <- function(counts_pb, sample_metadata) {
         original_vals[[bv]] <- raw_vals          # keep raw for plots
         bv_mean            <- mean(raw_vals, na.rm = TRUE)
         bv_sd              <- stats::sd(raw_vals, na.rm = TRUE)
+        if (is.na(bv_sd) || bv_sd == 0) {
+          message("    [", bv, "] Zero variance after sample filtering",
+                  " (all remaining samples share the same value) — skipping cell type.")
+          skip_ct <- TRUE
+          break
+        }
         col_data[[bv]]     <- (raw_vals - bv_mean) / bv_sd
         scale_factors[[bv]] <- list(mean = bv_mean, sd = bv_sd)
         message("    [", bv, "] Centered and scaled (mean=", round(bv_mean, 2),
@@ -91,6 +117,7 @@ run_deseq2_analysis <- function(counts_pb, sample_metadata) {
         original_vals[[bv]] <- as.character(col_data[[bv]])   # factor levels for plots
       }
     }
+    if (skip_ct) next
 
     # Validate and drop technical covariates with < 2 levels
     valid_covs <- COVARIATES[vapply(COVARIATES, function(v) {
@@ -158,6 +185,18 @@ run_deseq2_analysis <- function(counts_pb, sample_metadata) {
     dds      <- DESeqDataSetFromMatrix(countData = counts,
                                         colData   = col_data,
                                         design    = design_formula)
+
+    # Pre-estimate size factors; fall back to poscounts for sparse cell types
+    # where every gene has at least one zero across samples.
+    dds <- tryCatch(
+      estimateSizeFactors(dds),
+      error = function(e) {
+        if (grepl("every gene contains at least one zero", conditionMessage(e))) {
+          message("    Sparse data — retrying with poscounts size factor estimation.")
+          estimateSizeFactors(dds, type = "poscounts")
+        } else stop(e)
+      }
+    )
     dds      <- DESeq(dds, quiet = TRUE)
     vst_data <- getVarianceStabilizedData(dds)
 
